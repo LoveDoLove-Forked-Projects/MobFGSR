@@ -1,0 +1,30 @@
+#version 430 core
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout (r32ui, binding = 0) writeonly uniform uimage2D rw_reprojection;
+
+
+
+///// Uniforms /////
+layout (binding = 10, std140) uniform cb_t
+{
+    vec4 render_size;
+    vec4 presentation_size;
+    vec4 delta;
+    vec2 jitter_offset;
+    float depth_diff_threshold_sr;
+    float color_diff_threshold_fg;
+    float depth_diff_threshold_fg;
+    float depth_scale;
+    float depth_bias;
+    float render_scale;
+} cb;
+
+#define INVALID       uint(0xFFFFFFFF)
+
+
+
+void main()
+{
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    imageStore(rw_reprojection, pos, uvec4(INVALID));
+}

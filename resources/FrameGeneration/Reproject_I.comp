@@ -1,0 +1,104 @@
+﻿/* 
+ *        Interpolation version 
+ */
+
+#version 430 core
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout (binding = 0) uniform sampler2D r_current_depth;
+layout (binding = 1) uniform sampler2D r_current_motion_vector;
+layout (binding = 2) uniform sampler2D r_previous_motion_vector;
+layout (r32ui, binding = 3) uniform uimage2D rw_reprojection;
+
+
+
+///// Uniforms /////
+layout (binding = 10, std140) uniform cb_t
+{
+    vec4 render_size;
+    vec4 presentation_size;
+    vec4 delta;
+    vec2 jitter_offset;
+    float depth_diff_threshold_sr;
+    float color_diff_threshold_fg;
+    float depth_diff_threshold_fg;
+    float depth_scale;
+    float depth_bias;
+    float render_scale;
+} cb;
+
+
+
+///// Packing /////
+// Packing constants
+const uint depthBits = 11;
+const uint xBits = 11;
+const uint yBits = 10;
+
+const uint maxDepth = (1 << depthBits) - 1;
+const uint minX = -(1 << (xBits - 1));
+const uint maxX =  (1 << (xBits - 1)) - 1;
+const uint minY = -(1 << (yBits - 1));
+const uint maxY =  (1 << (yBits - 1)) - 1;
+
+// Pack (depth, relativePos.xy) to 11/11/10 uint
+// Depth precision: 0.0004882
+// RelativePos.x range: [-1024, 1023]
+// RelativePos.y range: [-512, 511]
+uint packReprojectionDataToUint(float depth, ivec2 sourcePos, ivec2 targetPos)
+{
+    uint uDepth = uint(float(maxDepth) * depth);
+    ivec2 relativePos = clamp(targetPos - sourcePos, ivec2(minX, minY), ivec2(maxX, maxY));
+    uvec2 uRelativePos = uvec2(relativePos - ivec2(minX, minY));
+
+    uint result = (uDepth << (32 - depthBits)) | (uRelativePos.x << yBits) | (uRelativePos.y);
+
+    return result;
+}
+
+float unpackDepthFromUint(uint reprojectionData)
+{
+    uint uDepth = reprojectionData >> (32 - depthBits);
+    return float(uDepth) / float(maxDepth);
+}
+
+ivec2 unpackSourcePosFromUint(uint reprojectionData, ivec2 targetPos)
+{
+    uint uRelativeX = (reprojectionData >> yBits) & uint((1 << xBits) - 1);
+    uint uRelativeY = reprojectionData & uint((1 << yBits) - 1);
+    ivec2 relativePos = ivec2(uRelativeX, uRelativeY) + ivec2(minX, minY);
+    ivec2 sourcePos = targetPos - relativePos;
+    return sourcePos;
+}
+
+
+
+void main() 
+{
+    ivec2 pos_t1 = ivec2(gl_GlobalInvocationID.xy);
+    
+    // Screen check
+    if (any(greaterThanEqual(pos_t1, ivec2(cb.render_size))))
+    {
+        return;
+    }
+    
+    vec2 uv = (vec2(pos_t1) + 0.5f) * cb.render_size.zw;
+    vec2 mv_t1 = texelFetch(r_current_motion_vector, pos_t1, 0).xy;
+    
+    // Linear motion estimation
+    //vec2 uvDelta = uv - mv_t1 * (1 -  cb.delta.x);
+    
+    // Quadratic motion estimation
+    ivec2 pos_t0 = ivec2((uv - mv_t1) * cb.render_size.xy);
+    vec2 mv_t0 = texelFetch(r_previous_motion_vector, pos_t0, 0).xy;
+    vec2 uvDelta = uv + (-1 + cb.delta.y + cb.delta.w) * mv_t1 + (cb.delta.y - cb.delta.w) * mv_t0;
+    
+    if (all(greaterThanEqual(uvDelta, vec2(0, 0))) && all(lessThanEqual(uvDelta, vec2(1, 1))))
+    {
+        // Store atomic minimum depth and relative position as uint
+        ivec2 posDelta = ivec2(uvDelta * cb.render_size.xy);
+        float depth = texelFetch(r_current_depth, pos_t1, 0).x;
+        uint data = packReprojectionDataToUint(depth, pos_t1, posDelta);
+        imageAtomicMin(rw_reprojection, posDelta, data);
+    }
+}

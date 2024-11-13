@@ -1,0 +1,22 @@
+#version 430 core
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout (binding = 0) uniform sampler2D r_load_motion_vector_x;
+layout (binding = 1) uniform sampler2D r_load_motion_vector_y;
+layout (rg16f, binding = 2) writeonly uniform image2D rw_load_motion_vector;
+
+void main()
+{
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    const vec4 bitShift = vec4(1.0, 1.0 / 255.0, 1.0 / (255.0 * 255.0), 1.0 / (255.0 * 255.0 * 255.0));
+    vec4 inputX = texelFetch(r_load_motion_vector_x, pos, 0) * bitShift;
+    vec4 inputY = texelFetch(r_load_motion_vector_y, pos, 0) * bitShift;
+    float mx = inputX.x + inputX.y + inputX.z + inputX.w;
+    float my = inputY.x + inputY.y + inputY.z + inputY.w;
+    mx = mx * float(2) - float(1);
+    my = my * float(2) - float(1);
+    
+    // Invert Y
+    my = -my;
+    
+    imageStore(rw_load_motion_vector, pos, vec4(mx, my, 0, 0));
+}

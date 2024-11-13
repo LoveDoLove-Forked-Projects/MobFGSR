@@ -1,0 +1,177 @@
+#version 430 core
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout (binding = 0) uniform usampler2D r_reprojection;
+layout (r32ui, binding = 1) writeonly uniform uimage2D rw_filled_reprojection;
+
+
+
+///// Uniforms /////
+layout (binding = 10, std140) uniform cb_t
+{
+    vec4 render_size;
+    vec4 presentation_size;
+    vec4 delta;
+    vec2 jitter_offset;
+    float depth_diff_threshold_sr;
+    float color_diff_threshold_fg;
+    float depth_diff_threshold_fg;
+    float depth_scale;
+    float depth_bias;
+    float render_scale;
+} cb;
+
+#define INVALID       uint(0xFFFFFFFF)
+
+
+
+///// Packing /////
+// Packing constants
+const uint depthBits = 11;
+const uint xBits = 11;
+const uint yBits = 10;
+
+const uint maxDepth = (1 << depthBits) - 1;
+const uint minX = -(1 << (xBits - 1));
+const uint maxX =  (1 << (xBits - 1)) - 1;
+const uint minY = -(1 << (yBits - 1));
+const uint maxY =  (1 << (yBits - 1)) - 1;
+
+// Pack (depth, relativePos.xy) to 11/11/10 uint
+// Depth precision: 0.0004882
+// RelativePos.x range: [-1024, 1023]
+// RelativePos.y range: [-512, 511]
+uint packReprojectionDataToUint(float depth, ivec2 sourcePos, ivec2 targetPos)
+{
+    uint uDepth = uint(float(maxDepth) * depth);
+    ivec2 relativePos = clamp(targetPos - sourcePos, ivec2(minX, minY), ivec2(maxX, maxY));
+    uvec2 uRelativePos = relativePos - ivec2(minX, minY);
+
+    uint result = (uDepth << (32 - depthBits)) | (uRelativePos.x << yBits) | (uRelativePos.y);
+
+    return result;
+}
+
+float unpackDepthFromUint(uint reprojectionData)
+{
+    uint uDepth = reprojectionData >> (32 - depthBits);
+    return float(uDepth) / float(maxDepth);
+}
+
+ivec2 unpackSourcePosFromUint(uint reprojectionData, ivec2 targetPos)
+{
+    uint uRelativeX = (reprojectionData >> yBits) & uint((1 << xBits) - 1);
+    uint uRelativeY = reprojectionData & uint((1 << yBits) - 1);
+    ivec2 relativePos = ivec2(uRelativeX, uRelativeY) + ivec2(minX, minY);
+    ivec2 sourcePos = targetPos - relativePos;
+    return sourcePos;
+}
+
+
+
+#define SETBIT(x) (1U << x)
+#define FILL_DEPTH_DIFF_THRESHOLD 0.0005
+
+// Select a neighboring pixel with valid value. And the depth of this pixel should be smaller than center pixel.
+void selectValidNeighbor(ivec2 centerPos, mediump float centerDepth, uint idx, inout mediump float nearestDepth, inout uint selectedData, inout uint mask) {
+    const ivec2 offsets[9] =
+    {
+        ivec2(-1, -1),
+        ivec2(-1, 0),
+        ivec2(-1, 1),
+        ivec2(0, -1),
+        ivec2(0, 0),
+        ivec2(0, 1),
+        ivec2(1, -1),
+        ivec2(1, 0),
+        ivec2(1, 1)
+    };
+    
+    ivec2 neighborPos = centerPos + offsets[idx];
+    if (any(lessThan(neighborPos, ivec2(0, 0))) || any(greaterThanEqual(neighborPos, ivec2(cb.render_size)))) return;
+    
+    uint neighborData = texelFetch(r_reprojection, neighborPos, 0).x;
+    bool neighborValid = bool(neighborData != INVALID);
+    mediump float neighborDepth = unpackDepthFromUint(neighborData);
+    
+    // For neighboring pixels to be candidates for filling, they must meet the following conditions:
+    // (1) Is valid
+    // (2) Have smaller depth than center pixel (foreground pixel relative to center pixel)
+    // Other pixels will be considered as "similar" to center pixel.
+    // If these kind of "similar" pixels can form a 2x2 square, there's no need for this pixel to be filled (or can't be filled) by neighboring pixels.
+    mediump float diff = centerDepth - neighborDepth;
+    if (neighborValid && diff > FILL_DEPTH_DIFF_THRESHOLD)
+    {
+        // Select the nearest
+        if (neighborDepth < nearestDepth)
+        {
+            nearestDepth = neighborDepth;
+            selectedData = neighborData;
+        }
+    }
+    else
+    {
+        mask |= SETBIT(idx);
+    }
+}
+
+void main() 
+{
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+
+    uint centerData = texelFetch(r_reprojection, pos, 0).x;
+    mediump float centerDepth = unpackDepthFromUint(centerData);
+    mediump float nearestDepth = 1;
+    uint selectedData = INVALID;
+    uint mask = SETBIT(4);
+
+    selectValidNeighbor(pos, centerDepth, 0, nearestDepth, selectedData, mask);
+    selectValidNeighbor(pos, centerDepth, 1, nearestDepth, selectedData, mask);
+    selectValidNeighbor(pos, centerDepth, 2, nearestDepth, selectedData, mask);
+    selectValidNeighbor(pos, centerDepth, 3, nearestDepth, selectedData, mask);
+    selectValidNeighbor(pos, centerDepth, 5, nearestDepth, selectedData, mask);
+    selectValidNeighbor(pos, centerDepth, 6, nearestDepth, selectedData, mask);
+    selectValidNeighbor(pos, centerDepth, 7, nearestDepth, selectedData, mask);
+    selectValidNeighbor(pos, centerDepth, 8, nearestDepth, selectedData, mask);
+
+    /*  
+        idx:
+        0 1 2
+        3 4 5
+        6 7 8
+    */
+    const uint rejectionMasks[4] = 
+    {
+        SETBIT(0) | SETBIT(1) | SETBIT(3) | SETBIT(4), // Upper left
+        SETBIT(1) | SETBIT(2) | SETBIT(4) | SETBIT(5), // Upper right
+        SETBIT(3) | SETBIT(4) | SETBIT(6) | SETBIT(7), // Lower left
+        SETBIT(4) | SETBIT(5) | SETBIT(7) | SETBIT(8), // Lower right
+    };
+
+    bool reject =
+        ((mask & rejectionMasks[0]) == rejectionMasks[0]) ||
+        ((mask & rejectionMasks[1]) == rejectionMasks[1]) ||
+        ((mask & rejectionMasks[2]) == rejectionMasks[2]) ||
+        ((mask & rejectionMasks[3]) == rejectionMasks[3]);
+    
+    uint result = 0;
+    if (reject) 
+    {
+        // "Similar" pixels form a 2x2 square...
+        if (centerData != INVALID)
+        {
+            // No need for filling
+            result = centerData;
+        }
+        else
+        {
+            // Nothing are projected to this pixel, mark this pixel
+            result = INVALID;
+        }
+    }
+    else 
+    {
+        // Replace with selected pixel's value
+        result = selectedData;
+    }
+    imageStore(rw_filled_reprojection, pos, uvec4(result));
+}

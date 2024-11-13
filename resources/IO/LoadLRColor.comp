@@ -1,0 +1,32 @@
+#version 430 core
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout (binding = 0) uniform sampler2D r_hr_load_color;
+layout (r32f, binding = 1) writeonly uniform image2D rw_lr_color;
+
+
+
+///// Uniforms /////
+layout (binding = 10, std140) uniform cb_t
+{
+    vec4 render_size;
+    vec4 presentation_size;
+    vec4 delta;
+    vec2 jitter_offset;
+    float depth_diff_threshold_sr;
+    float color_diff_threshold_fg;
+    float depth_diff_threshold_fg;
+    float depth_scale;
+    float depth_bias;
+    float render_scale;
+} cb;
+
+
+
+void main()
+{
+    ivec2 pos_LR = ivec2(gl_GlobalInvocationID.xy);
+    vec2 jitteredUV = (vec2(pos_LR) + vec2(0.5, 0.5) - cb.jitter_offset) * cb.render_size.zw;
+    ivec2 jitteredPos_HR = ivec2(jitteredUV * cb.presentation_size.xy);
+    vec4 color = texelFetch(r_hr_load_color, jitteredPos_HR, 0);
+    imageStore(rw_lr_color, pos_LR, color);
+}
