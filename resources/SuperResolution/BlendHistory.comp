@@ -178,7 +178,7 @@ void main()
     if (all(greaterThanEqual(prevUV, vec2(0, 0))) && all(lessThanEqual(prevUV, vec2(1, 1))) && depthDiff < cb.depth_diff_threshold_sr)
     {
         vec2 dist = fract(jitteredUV * cb.render_size.xy) - vec2(0.5, 0.5);
-        float weight = 0.25 - 0.4 * dist.x * dist.x + dist.y * dist.y;
+        float weight = 0.25 - 0.4 * (dist.x * dist.x + dist.y * dist.y);
         resultColor = mix(historySample, currentSample, weight);
     }
     else
